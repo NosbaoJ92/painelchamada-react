@@ -1,5 +1,5 @@
-// index.js
 require('dotenv').config();
+
 const http = require('http');
 const express = require('express');
 const { Server } = require('socket.io');
@@ -11,40 +11,50 @@ const app = express();
 const server = http.createServer(app);
 
 // =========================================================
-// CONFIGURAÇÃO DE CORS DINÂMICO
+// CONFIGURAÇÃO DE CORS
 // =========================================================
 const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
   : ['http://localhost:3000'];
 
 app.use(cors({
-  origin: (origin, callback) => {
-    // Permite requisições sem origem (como ferramentas locais)
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      console.warn(`🚫 Bloqueado acesso de origem não permitida: ${origin}`);
-      callback(new Error('CORS não permitido para esta origem.'));
-    }
-  },
+  origin: allowedOrigins,
   methods: ['GET', 'POST'],
   credentials: true,
 }));
 
+// =========================================================
+// ROTA TESTE
+// =========================================================
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    socket: true,
+    timestamp: new Date(),
+  });
+});
+
+// =========================================================
+// SOCKET.IO
+// =========================================================
 const io = new Server(server, {
   cors: {
     origin: allowedOrigins,
     methods: ['GET', 'POST'],
+    credentials: true,
   },
+  transports: ['websocket', 'polling'],
 });
 
 // =========================================================
-// VARIÁVEIS DE ESTADO GLOBAL
+// VARIÁVEIS GLOBAIS
 // =========================================================
 let normalCounter = 0;
 let priorityCounter = 0;
+
 let normalQueue = [];
 let priorityQueue = [];
+
 let lastCalledTickets = [];
 let callHistory = [];
 
@@ -52,96 +62,95 @@ const MAX_PANEL_CALLS = 4;
 const MAX_HISTORY = 50;
 
 // =========================================================
-// FUNÇÃO AUXILIAR: Broadcast geral do estado
+// FUNÇÃO AUXILIAR
 // =========================================================
 function broadcastQueueState() {
   const waitingQueueCombined = [...priorityQueue, ...normalQueue];
+
   const state = {
     normalQueue,
     priorityQueue,
     lastCalledTickets,
     waitingQueue: waitingQueueCombined,
+    callHistory,
   };
+
   io.emit('filas_atualizadas', state);
-  console.log(`[Broadcast] Filas atualizadas enviadas. Total em espera: ${waitingQueueCombined.length}`);
+
+  console.log(
+    `📡 Broadcast enviado | Espera: ${waitingQueueCombined.length}`
+  );
 }
 
 // =========================================================
-// FUNÇÃO DE GERAÇÃO DE RELATÓRIO DIÁRIO
+// RELATÓRIO
 // =========================================================
 function gerarRelatorioDoDia() {
-  if (normalQueue.length === 0 && priorityQueue.length === 0 && callHistory.length === 0) {
-    console.log('⚠️ Nenhum dado para gerar relatório diário.');
-    return;
-  }
+  try {
+    const agora = new Date();
 
-  const agora = new Date();
-  const dataFormatada = agora.toLocaleDateString('pt-BR');
-  const hora = agora.toLocaleTimeString('pt-BR');
+    const dataFormatada = agora.toLocaleDateString('pt-BR');
+    const hora = agora.toLocaleTimeString('pt-BR');
 
-  const totalNormal = normalQueue.length;
-  const totalPrioritaria = priorityQueue.length;
+    const relatorio = {
+      data: dataFormatada,
+      horaGeracao: hora,
+      totalNormal: normalQueue.length,
+      totalPrioritaria: priorityQueue.length,
+      totalHistorico: callHistory.length,
+      historico: callHistory,
+    };
 
-  const tempos = [];
-  callHistory.forEach(ch => {
-    const emitida = normalQueue.find(n => `${n.tipo}${n.numero}` === `${ch.tipo === 'prioritaria' ? 'P' : 'N'}${ch.numero}`);
-    if (emitida) {
-      const diff = (new Date(ch.timestamp) - new Date(emitida.timestamp)) / 60000;
-      tempos.push(diff);
+    const pasta = path.join(__dirname, 'relatorios');
+
+    if (!fs.existsSync(pasta)) {
+      fs.mkdirSync(pasta);
     }
-  });
 
-  const tempoMedio = tempos.length > 0
-    ? (tempos.reduce((a, b) => a + b, 0) / tempos.length).toFixed(2)
-    : 0;
+    const filePath = path.join(
+      pasta,
+      `relatorio-${dataFormatada.replace(/\//g, '-')}.json`
+    );
 
-  const geradasPorCelular = normalQueue.filter(s => s.origem === 'celular').length +
-                            priorityQueue.filter(s => s.origem === 'celular').length;
-  const geradasManualmente = normalQueue.filter(s => s.origem !== 'celular').length +
-                             priorityQueue.filter(s => s.origem !== 'celular').length;
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify(relatorio, null, 2),
+      'utf-8'
+    );
 
-  const relatorio = {
-    data: dataFormatada,
-    horaGeracao: hora,
-    totalSenhas: totalNormal + totalPrioritaria,
-    porTipo: {
-      normal: totalNormal,
-      prioritaria: totalPrioritaria,
-    },
-    tempoMedioEspera: `${tempoMedio} minutos`,
-    geradasPorCelular,
-    geradasManualmente,
-  };
-
-  const pasta = path.join(__dirname, 'relatorios');
-  if (!fs.existsSync(pasta)) fs.mkdirSync(pasta);
-
-  const filePath = path.join(pasta, `relatorio-${dataFormatada.replace(/\//g, '-')}.json`);
-  fs.writeFileSync(filePath, JSON.stringify(relatorio, null, 2), 'utf-8');
-
-  console.log(`✅ Relatório diário salvo: ${filePath}`);
+    console.log(`✅ Relatório salvo: ${filePath}`);
+  } catch (err) {
+    console.error('❌ Erro ao gerar relatório:', err.message);
+  }
 }
 
 // =========================================================
-// FUNÇÃO: Reiniciar contadores e filas (meia-noite)
+// RESET DIÁRIO
 // =========================================================
 function resetarSistemaDiariamente() {
-  console.log('🔄 Reiniciando sistema diário...');
+  console.log('🔄 Reset diário iniciado...');
+
   gerarRelatorioDoDia();
 
   normalCounter = 0;
   priorityCounter = 0;
+
   normalQueue = [];
   priorityQueue = [];
+
   lastCalledTickets = [];
   callHistory = [];
 
   broadcastQueueState();
+
+  console.log('✅ Sistema resetado.');
 }
 
 let ultimoDia = new Date().getDate();
+
 setInterval(() => {
   const hoje = new Date().getDate();
+
   if (hoje !== ultimoDia) {
     resetarSistemaDiariamente();
     ultimoDia = hoje;
@@ -149,117 +158,209 @@ setInterval(() => {
 }, 60000);
 
 // =========================================================
-// SOCKET.IO - EVENTOS PRINCIPAIS
+// SOCKET EVENTS
 // =========================================================
 io.on('connection', (socket) => {
-  console.log(`[Conexão] Novo cliente conectado: ${socket.id}`);
+  console.log(`🟢 Cliente conectado: ${socket.id}`);
 
   const waitingQueueCombined = [...priorityQueue, ...normalQueue];
+
+  // =====================================================
+  // ENVIA ESTADO INICIAL
+  // =====================================================
   socket.emit('estado_inicial', {
     normalQueue,
     priorityQueue,
-    lastCalledTickets,
     waitingQueue: waitingQueueCombined,
+    lastCalledTickets,
     callHistory,
   });
 
+  // =====================================================
+  // EMITIR SENHA
+  // =====================================================
   socket.on('emitir_senha_usuario', (tipo, callback, origem = 'manual') => {
     try {
       if (tipo !== 'normal' && tipo !== 'prioritaria') {
-        const errMsg = 'Tipo de senha inválido.';
-        if (typeof callback === 'function') callback({ error: true, message: errMsg });
+        const error = 'Tipo inválido';
+
+        if (typeof callback === 'function') {
+          callback({
+            success: false,
+            error,
+          });
+        }
+
         return;
       }
 
-      let numeroFormatado, newTicket = null;
+      let ticket;
 
       if (tipo === 'normal') {
         normalCounter++;
-        numeroFormatado = String(normalCounter).padStart(3, '0');
-        newTicket = {
+
+        ticket = {
           tipo: 'N',
-          numero: numeroFormatado,
+          numero: String(normalCounter).padStart(3, '0'),
           categoria: 'NORMAL',
           origem,
-          hora: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+          hora: new Date().toLocaleTimeString('pt-BR'),
           data: new Date().toLocaleDateString('pt-BR'),
           timestamp: Date.now(),
         };
-        normalQueue.push(newTicket);
+
+        normalQueue.push(ticket);
       } else {
         priorityCounter++;
-        numeroFormatado = String(priorityCounter).padStart(3, '0');
-        newTicket = {
+
+        ticket = {
           tipo: 'P',
-          numero: numeroFormatado,
+          numero: String(priorityCounter).padStart(3, '0'),
           categoria: 'PRIORITÁRIA',
           origem,
-          hora: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+          hora: new Date().toLocaleTimeString('pt-BR'),
           data: new Date().toLocaleDateString('pt-BR'),
           timestamp: Date.now(),
         };
-        priorityQueue.push(newTicket);
+
+        priorityQueue.push(ticket);
       }
 
-      console.log(`[Senha Emitida] ${newTicket.tipo}${newTicket.numero} (${origem})`);
+      console.log(`🎫 Senha emitida: ${ticket.tipo}${ticket.numero}`);
+
       broadcastQueueState();
 
       if (typeof callback === 'function') {
-        callback({ success: true, ticket: newTicket, numero: newTicket.numero });
+        callback({
+          success: true,
+          ticket,
+        });
       }
     } catch (err) {
-      console.error("[Erro] Falha ao emitir senha:", err.message);
-      if (typeof callback === 'function') callback({ error: true, message: err.message });
+      console.error('❌ Erro emitir senha:', err.message);
+
+      if (typeof callback === 'function') {
+        callback({
+          success: false,
+          error: err.message,
+        });
+      }
     }
   });
 
+  // =====================================================
+  // CHAMAR SENHA
+  // =====================================================
   socket.on('chamar_senha', (callInfo) => {
-    const { tipo, numero, guiche } = callInfo;
-    const tipoPrefixado = tipo === 'prioritaria' ? 'P' : 'N';
-    const ticketId = `${tipoPrefixado}${numero}`;
+    try {
+      const { tipo, numero, guiche } = callInfo;
 
-    io.emit('seu_guiche_chamado', { ticket: ticketId, guiche });
+      const currentCalled = {
+        tipo,
+        numero,
+        guiche,
+        timestamp: new Date().toISOString(),
+      };
 
-    const currentCalled = { tipo, numero, guiche, timestamp: new Date().toISOString() };
+      lastCalledTickets.unshift(currentCalled);
 
-    lastCalledTickets.unshift(currentCalled);
-    if (lastCalledTickets.length > MAX_PANEL_CALLS) lastCalledTickets.pop();
+      if (lastCalledTickets.length > MAX_PANEL_CALLS) {
+        lastCalledTickets.pop();
+      }
 
-    io.emit('senha_chamada', { currentCalled });
-    console.log(`[Chamada] Senha ${ticketId} chamada pelo Guichê ${guiche}.`);
+      io.emit('senha_chamada', {
+        currentCalled,
+      });
+
+      console.log(
+        `📢 Senha chamada: ${tipo}${numero} | Guichê ${guiche}`
+      );
+    } catch (err) {
+      console.error('❌ Erro chamar senha:', err.message);
+    }
   });
 
+  // =====================================================
+  // SINCRONIZAR FILAS
+  // =====================================================
   socket.on('sincronizar_filas_apos_chamada', (data) => {
-    normalQueue = Array.isArray(data.normalQueue) ? data.normalQueue : normalQueue;
-    priorityQueue = Array.isArray(data.priorityQueue) ? data.priorityQueue : priorityQueue;
-    broadcastQueueState();
+    try {
+      normalQueue = Array.isArray(data.normalQueue)
+        ? data.normalQueue
+        : normalQueue;
+
+      priorityQueue = Array.isArray(data.priorityQueue)
+        ? data.priorityQueue
+        : priorityQueue;
+
+      broadcastQueueState();
+
+      console.log('🔄 Filas sincronizadas.');
+    } catch (err) {
+      console.error('❌ Erro sincronizar filas:', err.message);
+    }
   });
 
+  // =====================================================
+  // FINALIZAR ATENDIMENTO
+  // =====================================================
   socket.on('finalizar_atendimento', (ticketInfo) => {
-    const { guiche, tipo, numero, timestamp } = ticketInfo;
-    const tipoPrefixado = tipo === 'prioritaria' ? 'P' : 'N';
-    const ticket = `${tipoPrefixado}${numero}`;
+    try {
+      const { guiche, tipo, numero } = ticketInfo;
 
-    const newEntry = { guiche, ticket, tipo, numero, timestamp };
-    callHistory.unshift(newEntry);
-    if (callHistory.length > MAX_HISTORY) callHistory.pop();
+      const newEntry = {
+        guiche,
+        tipo,
+        numero,
+        timestamp: new Date().toISOString(),
+      };
 
-    io.emit('historico_adicionado', newEntry);
-    console.log(`[Finalizar] Atendimento finalizado: ${ticket} no Guichê ${guiche}`);
+      callHistory.unshift(newEntry);
+
+      if (callHistory.length > MAX_HISTORY) {
+        callHistory.pop();
+      }
+
+      io.emit('historico_adicionado', newEntry);
+
+      console.log(
+        `✅ Atendimento finalizado: ${tipo}${numero} | Guichê ${guiche}`
+      );
+    } catch (err) {
+      console.error('❌ Erro finalizar atendimento:', err.message);
+    }
   });
 
-  socket.on('disconnect', () => {
-    console.log(`[Desconexão] Cliente desconectado: ${socket.id}`);
+  // =====================================================
+  // DESCONECTOU
+  // =====================================================
+  socket.on('disconnect', (reason) => {
+    console.log(`🔴 Cliente desconectado: ${socket.id}`);
+    console.log(`📌 Motivo: ${reason}`);
+  });
+
+  // =====================================================
+  // ERRO SOCKET
+  // =====================================================
+  socket.on('error', (err) => {
+    console.error(`❌ Socket erro: ${err.message}`);
   });
 });
 
 // =========================================================
-// INICIALIZAÇÃO DO SERVIDOR
+// START SERVER
 // =========================================================
-const PORT = process.env.SERVER_PORT || 3001;
+const PORT = process.env.PORT || 3001;
 const HOST = process.env.SERVER_HOST || '0.0.0.0';
 
 server.listen(PORT, HOST, () => {
-  console.log(`✅ Servidor Socket.IO rodando em http://${HOST}:${PORT}`);
-  console.log(`🌐 Origens permitidas: ${allowedOrigins.join(', ')}`);
-});
+  console.log('=================================================');
+  console.log(`✅ Servidor online`);
+  console.log(`🌐 HOST: ${HOST}`);
+  console.log(`🚪 PORTA: ${PORT}`);
+  console.log(`🔗 URL: http://${HOST}:${PORT}`);
+  console.log(`🟢 Socket.IO ativo`);
+  console.log(`🌍 Origins permitidas:`);
+  console.log(allowedOrigins);
+  console.log('=================================================');
+}); 
